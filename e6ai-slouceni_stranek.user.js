@@ -1,9 +1,19 @@
 // ==UserScript==
 // @name         e6AI: Sloučení stránek + vlastní stránkování
-// @namespace    https://e6ai.net/
-// @version      1.0
+// @namespace    https://github.com/Kamdar-Wolf/Script
+// @version      1.1
 // @description  Sloučí všechny stránky výsledků do jedné a umožní zvolit počet náhledů na stránku.
+// @author       Kamdar
+// @copyright    2026, Kamdar
+// @license      Proprietary - internal use only
+// @homepageURL  https://github.com/Kamdar-Wolf/Script
+// @website      https://e6ai.net/
+// @source       https://raw.githubusercontent.com/Kamdar-Wolf/Script/master/e6ai-slouceni_stranek.user.js
+// @supportURL   https://github.com/Kamdar-Wolf/Script/issues
+// @updateURL    https://raw.githubusercontent.com/Kamdar-Wolf/Script/master/e6ai-slouceni_stranek.user.js
+// @downloadURL  https://raw.githubusercontent.com/Kamdar-Wolf/Script/master/e6ai-slouceni_stranek.user.js
 // @match        https://e6ai.net/posts*
+// @noframes
 // @run-at       document-end
 // @grant        none
 // ==/UserScript==
