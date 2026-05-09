@@ -2,7 +2,7 @@
 // @name              Steam-HW
 // @name:cs           Steam-HW: porovnání hardwaru
 // @namespace         https://github.com/Kamdar-Wolf/Script
-// @version           1.1.2
+// @version           1.1.3
 // @description       Porovnává hardware zadaný uživatelem s minimálními a doporučenými požadavky her na Steam Store a ukazuje odhad hratelnosti.
 // @author            Kamdar-Wolf
 // @license           MIT
@@ -32,7 +32,7 @@
     const SCRIPT = {
         id: 'steam-hw',
         name: 'Steam-HW',
-        version: '1.1.2',
+        version: '1.1.3',
         author: 'Kamdar-Wolf',
         license: 'MIT',
         profileKey: 'steam-hw.profileText',
@@ -55,9 +55,14 @@
     const COOKIE_SAFE_MAX_BYTES = 2800;
     const COOKIE_MAX_AGE_SECONDS = 60 * 60 * 24 * 365;
     const SURVEY_REFRESH_MS = 1000 * 60 * 60 * 24 * 30;
-    const BADGE_FETCH_LIMIT = 12;
+    const BADGE_OBSERVE_LIMIT = 180;
+    const BADGE_FALLBACK_LIMIT = 16;
+    const BADGE_CONCURRENT_FETCHES = 3;
     const appRequirementCache = new Map();
+    const badgeFetchQueue = [];
     let badgeScanTimer = null;
+    let badgeObserver = null;
+    let badgeActiveFetches = 0;
     let surveyRefreshInFlight = null;
 
     const WEIGHTS = {
@@ -279,6 +284,7 @@
             if (event.target.id === 'steam-hw-card-profile-select') {
                 setActiveProfileId(event.target.value);
                 renderPageAnalysis(true);
+                resetAppBadges();
                 scheduleBadgeScan();
                 return;
             }
@@ -1606,10 +1612,7 @@
     function scanAppBadges() {
         const options = readOptions();
         if (!options.showStoreBadges) {
-            document.querySelectorAll('.steam-hw-app-badge').forEach((badge) => badge.remove());
-            document.querySelectorAll('[data-steam-hw-badge-bound]').forEach((element) => {
-                delete element.dataset.steamHwBadgeBound;
-            });
+            resetAppBadges();
             return;
         }
 
@@ -1618,23 +1621,30 @@
             return;
         }
 
-        const seenAppIds = new Set();
+        const seenContainers = new Set();
         const candidates = Array.from(document.querySelectorAll('[data-ds-appid], a[href*="/app/"]'))
-            .map((element) => ({ element, appId: extractAppId(element) }))
+            .map((element) => {
+                const container = findBadgeContainer(element);
+                return { element, container, appId: extractAppId(element) };
+            })
             .filter((item) => {
-                if (!item.appId || item.element.dataset.steamHwBadgeBound || seenAppIds.has(item.appId)) {
+                if (!item.appId || !item.container || item.container.dataset.steamHwBadgeBound || item.container.dataset.steamHwBadgeObserved || seenContainers.has(item.container)) {
                     return false;
                 }
-                seenAppIds.add(item.appId);
+                seenContainers.add(item.container);
                 return true;
             })
-            .slice(0, BADGE_FETCH_LIMIT);
+            .slice(0, BADGE_OBSERVE_LIMIT);
 
-        candidates.forEach(({ element, appId }) => {
-            element.dataset.steamHwBadgeBound = '1';
-            const badge = createAppBadge('HW...', 'unknown');
-            attachAppBadge(element, badge);
-            evaluateAppBadge(appId, badge);
+        const observer = ensureBadgeObserver();
+        candidates.forEach(({ container, appId }) => {
+            container.dataset.steamHwAppId = appId;
+            if (observer) {
+                container.dataset.steamHwBadgeObserved = '1';
+                observer.observe(container);
+            } else if (document.querySelectorAll('.steam-hw-app-badge').length < BADGE_FALLBACK_LIMIT) {
+                processBadgeCandidate(container);
+            }
         });
     }
 
@@ -1652,15 +1662,62 @@
         return match ? match[1] : '';
     }
 
-    function createAppBadge(label, status) {
+    function ensureBadgeObserver() {
+        if (!('IntersectionObserver' in window)) {
+            return null;
+        }
+
+        if (badgeObserver) {
+            return badgeObserver;
+        }
+
+        badgeObserver = new IntersectionObserver((entries) => {
+            entries.forEach((entry) => {
+                if (!entry.isIntersecting) {
+                    return;
+                }
+                badgeObserver.unobserve(entry.target);
+                delete entry.target.dataset.steamHwBadgeObserved;
+                processBadgeCandidate(entry.target);
+            });
+        }, { root: null, rootMargin: '520px 0px', threshold: 0.01 });
+
+        return badgeObserver;
+    }
+
+    function processBadgeCandidate(container) {
+        const appId = container.dataset.steamHwAppId;
+        if (!appId || container.dataset.steamHwBadgeBound) {
+            return;
+        }
+
+        container.dataset.steamHwBadgeBound = '1';
+        const badge = createAppBadge();
+        attachAppBadge(container, badge);
+        queueBadgeEvaluation(appId, badge);
+    }
+
+    function createAppBadge() {
         const badge = document.createElement('span');
-        badge.className = `steam-hw-app-badge ${status}`;
-        badge.textContent = label;
+        badge.className = 'steam-hw-app-badge unknown loading';
+        badge.setAttribute('tabindex', '0');
+        badge.setAttribute('aria-label', 'Steam-HW kontrola se načítá');
+        badge.innerHTML = `
+            <span class="steam-hw-badge-dot" aria-hidden="true"></span>
+            <span class="steam-hw-badge-label">HW</span>
+            <span class="steam-hw-badge-popover" role="tooltip">
+                <strong>Steam-HW</strong>
+                <span>Načítám požadavky hry...</span>
+            </span>
+        `;
         return badge;
     }
 
-    function attachAppBadge(element, badge) {
-        const container = element.closest('.search_result_row, .wishlist_row, .tab_item, .recommendation_highlight, [data-ds-appid]') || element;
+    function findBadgeContainer(element) {
+        return element.closest('.search_result_row, .wishlist_row, .tab_item, .recommendation_highlight, .salepreviewwidgets_StoreSaleWidgetHalfLeft_2Va3O, .salepreviewwidgets_StoreSaleWidgetHalfRight_2z-Oj, [data-ds-appid]') || element;
+    }
+
+    function attachAppBadge(container, badge) {
         if (container.querySelector?.('.steam-hw-app-badge')) {
             return;
         }
@@ -1668,11 +1725,33 @@
         container.appendChild(badge);
     }
 
+    function queueBadgeEvaluation(appId, badge) {
+        badgeFetchQueue.push({ appId, badge });
+        drainBadgeQueue();
+    }
+
+    function drainBadgeQueue() {
+        while (badgeActiveFetches < BADGE_CONCURRENT_FETCHES && badgeFetchQueue.length) {
+            const item = badgeFetchQueue.shift();
+            badgeActiveFetches += 1;
+            evaluateAppBadge(item.appId, item.badge)
+                .finally(() => {
+                    badgeActiveFetches -= 1;
+                    drainBadgeQueue();
+                });
+        }
+    }
+
     function evaluateAppBadge(appId, badge) {
-        getAppRequirements(appId)
+        return getAppRequirements(appId)
             .then((requirements) => {
                 if (!requirements) {
-                    setBadgeState(badge, 'HW ?', 'unknown', 'Požadavky se nepodařilo najít.');
+                    setBadgeState(badge, {
+                        status: 'unknown',
+                        label: 'HW',
+                        title: 'Nelze určit',
+                        lines: ['Požadavky se nepodařilo najít.'],
+                    });
                     return;
                 }
 
@@ -1685,16 +1764,51 @@
                     : evaluation.score < 70
                         ? 'warn'
                         : 'good';
-                const label = status === 'good' ? 'HW OK' : status === 'warn' ? 'HW Low' : 'HW Risk';
-                setBadgeState(badge, label, status, `${requirements.gameTitle}: ${evaluation.verdict.title} (${evaluation.score} %)`);
+                setBadgeState(badge, buildBadgeInfo(requirements, evaluation, status));
             })
-            .catch(() => setBadgeState(badge, 'HW ?', 'unknown', 'Kontrola selhala.'));
+            .catch(() => setBadgeState(badge, {
+                status: 'unknown',
+                label: 'HW',
+                title: 'Kontrola selhala',
+                lines: ['Zkus stránku načíst znovu později.'],
+            }));
     }
 
-    function setBadgeState(badge, label, status, title) {
-        badge.textContent = label;
+    function buildBadgeInfo(requirements, evaluation, status) {
+        const scenario = evaluation.scenarios.find((item) => item.label === '1080p Low') || evaluation.scenarios[0];
+        const weak = evaluation.rows
+            .filter((row) => row.score != null)
+            .sort((a, b) => (a.score || 0) - (b.score || 0))[0];
+
+        return {
+            status,
+            label: `${evaluation.score}`,
+            title: `${requirements.gameTitle}: ${evaluation.verdict.title}`,
+            lines: [
+                `Hratelnost: ${evaluation.score} %`,
+                scenario ? `${scenario.label}: ${scenario.text}` : '',
+                weak ? `Nejslabší: ${weak.label}` : '',
+            ].filter(Boolean),
+        };
+    }
+
+    function setBadgeState(badge, info) {
+        const status = info.status || 'unknown';
         badge.className = `steam-hw-app-badge ${status}`;
-        badge.title = title || label;
+        badge.setAttribute('aria-label', `Steam-HW: ${info.title || info.label}`);
+        badge.title = '';
+
+        const label = badge.querySelector('.steam-hw-badge-label');
+        const popover = badge.querySelector('.steam-hw-badge-popover');
+        if (label) {
+            label.textContent = info.label || 'HW';
+        }
+        if (popover) {
+            popover.innerHTML = `
+                <strong>${escapeHtml(info.title || 'Steam-HW')}</strong>
+                ${info.lines.map((line) => `<span>${escapeHtml(line)}</span>`).join('')}
+            `;
+        }
     }
 
     function getAppRequirements(appId) {
@@ -1714,6 +1828,20 @@
                 appRequirementCache.set(appId, requirements);
                 return requirements;
             });
+    }
+
+    function resetAppBadges() {
+        document.querySelectorAll('.steam-hw-app-badge').forEach((badge) => badge.remove());
+        document.querySelectorAll('[data-steam-hw-badge-bound], [data-steam-hw-badge-observed], [data-steam-hw-app-id]').forEach((element) => {
+            delete element.dataset.steamHwBadgeBound;
+            delete element.dataset.steamHwBadgeObserved;
+            delete element.dataset.steamHwAppId;
+        });
+        if (badgeObserver) {
+            badgeObserver.disconnect();
+            badgeObserver = null;
+        }
+        badgeFetchQueue.length = 0;
     }
 
     function openSettingsDialog() {
@@ -1855,6 +1983,7 @@
         closeSettingsDialog();
         notify('Steam-HW', 'HW profil byl uložen.');
         renderPageAnalysis(true);
+        resetAppBadges();
         scheduleBadgeScan();
     }
 
@@ -1871,6 +2000,7 @@
             name.value = 'Můj počítač';
         }
         renderPageAnalysis(true);
+        resetAppBadges();
         notify('Steam-HW', 'HW profil byl vymazán.');
     }
 
@@ -2998,34 +3128,140 @@
 
             .steam-hw-badge-host {
                 position: relative;
+                overflow: visible !important;
             }
 
             .steam-hw-app-badge {
                 position: absolute;
-                right: 8px;
-                top: 8px;
-                z-index: 4;
-                border-radius: 4px;
-                padding: 3px 6px;
-                background: rgba(15, 23, 31, 0.88);
+                right: 6px;
+                top: 6px;
+                z-index: 20;
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                gap: 4px;
+                min-width: 24px;
+                height: 22px;
+                box-sizing: border-box;
+                border: 1px solid rgba(255, 255, 255, 0.16);
+                border-radius: 999px;
+                padding: 2px 6px;
+                background: rgba(8, 13, 18, 0.78);
+                backdrop-filter: blur(4px);
                 color: #dfe3e6;
-                font-size: 11px;
+                font-size: 10px;
                 font-weight: 700;
                 line-height: 1.2;
+                pointer-events: auto;
+                cursor: help;
+                box-shadow: 0 2px 8px rgba(0, 0, 0, 0.30);
+            }
+
+            .steam-hw-app-badge::before {
+                content: "";
+                position: absolute;
+                inset: -6px;
+            }
+
+            .steam-hw-badge-dot {
+                width: 8px;
+                height: 8px;
+                flex: 0 0 8px;
+                border-radius: 50%;
+                background: #8b929a;
+                box-shadow: 0 0 0 2px rgba(139, 146, 154, 0.18);
+            }
+
+            .steam-hw-badge-label {
+                max-width: 24px;
+                overflow: hidden;
+                white-space: nowrap;
+            }
+
+            .steam-hw-badge-popover {
+                position: absolute;
+                top: calc(100% + 8px);
+                right: 0;
+                width: 210px;
+                display: grid;
+                gap: 4px;
+                padding: 9px 10px;
+                border: 1px solid rgba(102, 192, 244, 0.28);
+                border-radius: 5px;
+                background: rgba(14, 20, 27, 0.98);
+                color: #dfe3e6;
+                font-size: 12px;
+                font-weight: 400;
+                line-height: 1.35;
+                text-align: left;
+                white-space: normal;
+                opacity: 0;
+                transform: translateY(-4px);
                 pointer-events: none;
-                box-shadow: 0 2px 8px rgba(0, 0, 0, 0.28);
+                transition: opacity 120ms ease, transform 120ms ease;
+                box-shadow: 0 12px 28px rgba(0, 0, 0, 0.46);
+            }
+
+            .steam-hw-badge-popover strong {
+                color: #ffffff;
+                font-weight: 700;
+            }
+
+            .steam-hw-badge-popover span {
+                color: #acb8c1;
+            }
+
+            .steam-hw-app-badge:hover,
+            .steam-hw-app-badge:focus {
+                background: rgba(8, 13, 18, 0.94);
+                border-color: rgba(102, 192, 244, 0.45);
+                outline: none;
+            }
+
+            .steam-hw-app-badge:hover .steam-hw-badge-popover,
+            .steam-hw-app-badge:focus .steam-hw-badge-popover {
+                opacity: 1;
+                transform: translateY(0);
             }
 
             .steam-hw-app-badge.good {
                 color: #c7ef49;
             }
 
+            .steam-hw-app-badge.good .steam-hw-badge-dot {
+                background: #a4d007;
+                box-shadow: 0 0 0 2px rgba(164, 208, 7, 0.24);
+            }
+
             .steam-hw-app-badge.warn {
                 color: #ffd27a;
             }
 
+            .steam-hw-app-badge.warn .steam-hw-badge-dot {
+                background: #f3c15d;
+                box-shadow: 0 0 0 2px rgba(243, 193, 93, 0.24);
+            }
+
             .steam-hw-app-badge.fail {
                 color: #ffaaa4;
+            }
+
+            .steam-hw-app-badge.fail .steam-hw-badge-dot {
+                background: #ff7b72;
+                box-shadow: 0 0 0 2px rgba(255, 123, 114, 0.24);
+            }
+
+            .steam-hw-app-badge.unknown.loading .steam-hw-badge-dot {
+                animation: steam-hw-pulse 1.1s ease-in-out infinite;
+            }
+
+            @keyframes steam-hw-pulse {
+                0%, 100% {
+                    opacity: 0.45;
+                }
+                50% {
+                    opacity: 1;
+                }
             }
 
             #steam-hw-modal {
