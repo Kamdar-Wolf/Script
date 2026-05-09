@@ -2,7 +2,7 @@
 // @name              Steam-HW
 // @name:cs           Steam-HW: porovnání hardwaru
 // @namespace         https://github.com/Kamdar-Wolf/Script
-// @version           1.0.0
+// @version           1.1.1
 // @description       Porovnává hardware zadaný uživatelem s minimálními a doporučenými požadavky her na Steam Store a ukazuje odhad hratelnosti.
 // @author            Kamdar-Wolf
 // @license           MIT
@@ -32,20 +32,33 @@
     const SCRIPT = {
         id: 'steam-hw',
         name: 'Steam-HW',
-        version: '0.1.0',
-        author: 'Kamdar',
+        version: '1.1.1',
+        author: 'Kamdar-Wolf',
         license: 'MIT',
         profileKey: 'steam-hw.profileText',
         optionsKey: 'steam-hw.options',
+        profilesKey: 'steam-hw.profiles',
+        surveyKey: 'steam-hw.hardwareSurvey',
+        cookiePrefix: 'steam_hw_',
     };
 
     const DEFAULT_OPTIONS = {
         useAdvertisedVram: true,
         showTechnicalScores: true,
         compactDisplay: false,
+        useSteamSurvey: true,
+        showStoreBadges: true,
     };
 
     const SCORE_UNKNOWN = null;
+    const COOKIE_MAX_CHUNKS = 60;
+    const COOKIE_CHUNK_SIZE = 3000;
+    const COOKIE_MAX_AGE_SECONDS = 60 * 60 * 24 * 365;
+    const SURVEY_REFRESH_MS = 1000 * 60 * 60 * 24 * 30;
+    const BADGE_FETCH_LIMIT = 12;
+    const appRequirementCache = new Map();
+    let badgeScanTimer = null;
+    let surveyRefreshInFlight = null;
 
     const WEIGHTS = {
         gpu: 0.36,
@@ -183,6 +196,8 @@
         registerMenuCommands();
         ready(() => {
             renderPageAnalysis();
+            refreshSurveyCacheIfNeeded();
+            scheduleBadgeScan();
             installDelegatedEvents();
             observeSteamPageChanges();
         });
@@ -203,8 +218,10 @@
 
         GM_registerMenuCommand('Nastavení Steam-HW', openSettingsDialog, 's');
         GM_registerMenuCommand('Znovu vyhodnotit stránku', () => renderPageAnalysis(true), 'r');
+        GM_registerMenuCommand('Aktualizovat Steam HW Survey cache', () => refreshSurveyCache(true), 'u');
         GM_registerMenuCommand('Vymazat uložený HW profil', () => {
             deleteStoredValue(SCRIPT.profileKey);
+            deleteStoredValue(SCRIPT.profilesKey);
             notify('Steam-HW', 'Uložený HW profil byl vymazán.');
             renderPageAnalysis(true);
         }, 'd');
@@ -230,17 +247,42 @@
                 renderPageAnalysis(true);
             } else if (action === 'toggle-compact') {
                 toggleCompactDisplay();
+            } else if (action === 'profile-new') {
+                createProfileFromDialog();
+            } else if (action === 'profile-duplicate') {
+                duplicateProfileFromDialog();
+            } else if (action === 'profile-delete') {
+                deleteProfileFromDialog();
+            } else if (action === 'refresh-survey') {
+                refreshSurveyCache(true);
             }
         });
 
         document.addEventListener('input', (event) => {
-            if (event.target && event.target.id === 'steam-hw-profile-input') {
-                updateSettingsPreview(event.target.value);
+            if (event.target && ['steam-hw-profile-input', 'steam-hw-override-cpu', 'steam-hw-override-gpu', 'steam-hw-override-vram', 'steam-hw-override-ram'].includes(event.target.id)) {
+                const input = document.getElementById('steam-hw-profile-input');
+                updateSettingsPreview(input ? input.value : '');
             }
         });
 
         document.addEventListener('change', (event) => {
-            if (!event.target || !['steam-hw-option-vram', 'steam-hw-option-scores', 'steam-hw-option-compact'].includes(event.target.id)) {
+            if (!event.target) {
+                return;
+            }
+
+            if (event.target.id === 'steam-hw-profile-select') {
+                switchSettingsProfile(event.target.value);
+                return;
+            }
+
+            if (event.target.id === 'steam-hw-card-profile-select') {
+                setActiveProfileId(event.target.value);
+                renderPageAnalysis(true);
+                scheduleBadgeScan();
+                return;
+            }
+
+            if (!['steam-hw-option-vram', 'steam-hw-option-scores', 'steam-hw-option-compact', 'steam-hw-option-survey', 'steam-hw-option-badges'].includes(event.target.id)) {
                 return;
             }
             const input = document.getElementById('steam-hw-profile-input');
@@ -275,7 +317,10 @@
             }
 
             window.clearTimeout(timer);
-            timer = window.setTimeout(() => renderPageAnalysis(false), 250);
+            timer = window.setTimeout(() => {
+                renderPageAnalysis(false);
+                scheduleBadgeScan();
+            }, 250);
         });
 
         observer.observe(document.body, { childList: true, subtree: true });
@@ -289,19 +334,23 @@
             if (oldCard && force) {
                 oldCard.remove();
             }
+            removePurchaseWarning();
             return;
         }
 
-        const profileText = readProfileText();
+        const profiles = readProfiles();
+        const activeProfile = getActiveProfile(profiles);
+        const profileText = activeProfile.text || '';
         const options = readOptions();
         let html;
+        let evaluation = null;
 
         if (!profileText.trim()) {
-            html = renderMissingProfileCard(requirements);
+            html = renderMissingProfileCard(requirements, profiles, activeProfile);
         } else {
-            const profile = parseSteamHardwareProfile(profileText, options);
-            const evaluation = evaluateProfile(requirements, profile, options);
-            html = renderEvaluationCard(requirements, profile, evaluation, options);
+            const profile = parseSteamHardwareProfile(profileText, options, activeProfile);
+            evaluation = evaluateProfile(requirements, profile, options);
+            html = renderEvaluationCard(requirements, profile, evaluation, options, profiles, activeProfile);
         }
 
         const card = document.createElement('div');
@@ -310,6 +359,7 @@
 
         if (oldCard) {
             oldCard.replaceWith(card);
+            renderPurchaseWarning(evaluation, requirements);
             return;
         }
 
@@ -319,10 +369,11 @@
         }
 
         insertionTarget.parentNode.insertBefore(card, insertionTarget);
+        renderPurchaseWarning(evaluation, requirements);
     }
 
-    function parseRequirementsFromPage() {
-        const sysReqNodes = Array.from(document.querySelectorAll('.game_area_sys_req, .sysreq_content'));
+    function parseRequirementsFromPage(root = document) {
+        const sysReqNodes = Array.from(root.querySelectorAll('.game_area_sys_req, .sysreq_content'));
         if (!sysReqNodes.length) {
             return null;
         }
@@ -341,9 +392,9 @@
         }
 
         const gameTitle =
-            text(document.querySelector('#appHubAppName')) ||
-            text(document.querySelector('.apphub_AppName')) ||
-            text(document.querySelector('h1')) ||
+            text(root.querySelector('#appHubAppName')) ||
+            text(root.querySelector('.apphub_AppName')) ||
+            text(root.querySelector('h1')) ||
             'Tato hra';
 
         return {
@@ -473,7 +524,7 @@
         fields[field] = [fields[field], value].filter(Boolean).join(' / ');
     }
 
-    function parseSteamHardwareProfile(input, options) {
+    function parseSteamHardwareProfile(input, options, profileRecord = {}) {
         const profile = {
             rawText: input || '',
             computer: {},
@@ -507,7 +558,7 @@
             handleProfileFact(profile, section, match[1], match[2], line);
         });
 
-        finalizeProfile(profile, options);
+        finalizeProfile(profile, options, profileRecord.overrides || {});
         return profile;
     }
 
@@ -617,7 +668,7 @@
         }
     }
 
-    function finalizeProfile(profile, options) {
+    function finalizeProfile(profile, options, overrides = {}) {
         const gpuNameVram = parseVramFromText(profile.gpu.name || '');
         profile.gpu.advertisedVramMb = gpuNameVram || null;
 
@@ -641,6 +692,8 @@
             profile.warnings.push('Steam u integrované grafiky hlásí nízkou primární VRAM. Skript použil větší hodnotu z názvu GPU, ale výsledek je potřeba brát orientačně.');
         }
 
+        applyProfileOverrides(profile, overrides);
+
         if (!profile.cpu.name) {
             profile.warnings.push('V HW profilu se nepodařilo najít název procesoru.');
         }
@@ -649,6 +702,44 @@
         }
         if (!profile.memory.ramMb) {
             profile.warnings.push('V HW profilu se nepodařilo najít velikost RAM.');
+        }
+    }
+
+    function applyProfileOverrides(profile, overrides) {
+        if (!overrides || typeof overrides !== 'object') {
+            return;
+        }
+
+        const cpuAs = cleanText(overrides.cpuAs || '');
+        if (cpuAs) {
+            const scoreInfo = scoreCpu(cpuAs, profile.cpu.cores, profile.cpu.speedMhz);
+            if (scoreInfo.score) {
+                profile.cpu.originalName = profile.cpu.name || '';
+                profile.cpu.scoreInfo = { ...scoreInfo, label: `${scoreInfo.label || cpuAs} (ruční oprava)` };
+                profile.cpu.name = profile.cpu.name || cpuAs;
+                profile.warnings.push(`Procesor je pro porovnání ručně počítán jako ${cpuAs}.`);
+            }
+        }
+
+        const gpuAs = cleanText(overrides.gpuAs || '');
+        if (gpuAs) {
+            const scoreInfo = scoreGpu(gpuAs);
+            if (scoreInfo.score) {
+                profile.gpu.originalName = profile.gpu.name || '';
+                profile.gpu.scoreInfo = { ...scoreInfo, label: `${scoreInfo.label || gpuAs} (ruční oprava)` };
+                profile.gpu.name = profile.gpu.name || gpuAs;
+                profile.warnings.push(`Grafická karta je pro porovnání ručně počítána jako ${gpuAs}.`);
+            }
+        }
+
+        if (overrides.vramMb) {
+            profile.gpu.effectiveVramMb = Number(overrides.vramMb);
+            profile.warnings.push(`VRAM je ručně nastavena na ${formatMb(profile.gpu.effectiveVramMb)}.`);
+        }
+
+        if (overrides.ramMb) {
+            profile.memory.ramMb = Number(overrides.ramMb);
+            profile.warnings.push(`RAM je ručně nastavena na ${formatMb(profile.memory.ramMb)}.`);
         }
     }
 
@@ -686,7 +777,85 @@
             recommendedFailures,
             criticalFailures,
             verdict: verdictForScore(Math.round(playability), criticalFailures),
+            scenarios: buildPlayScenarios(Math.round(playability), rows, criticalFailures),
+            recommendations: buildRecommendations(Math.round(playability), rows, profile, criticalFailures),
         };
+    }
+
+    function buildPlayScenarios(score, rows, criticalFailures) {
+        const byId = Object.fromEntries(rows.map((row) => [row.id, row]));
+        const gpuScore = byId.gpu?.score ?? score;
+        const cpuScore = byId.cpu?.score ?? score;
+        const vramScore = byId.vram?.score ?? 100;
+        const hasCriticalFailure = criticalFailures.length > 0;
+
+        return [
+            {
+                label: '1080p Low',
+                status: hasCriticalFailure ? (score >= 45 ? 'warn' : 'fail') : score >= 55 ? 'good' : 'warn',
+                text: hasCriticalFailure ? (score >= 45 ? 'rizikové' : 'spíš ne') : score >= 55 ? 'pravděpodobně ano' : 'jen s rizikem',
+            },
+            {
+                label: '1080p Medium',
+                status: !hasCriticalFailure && score >= 72 && gpuScore >= 65 ? 'good' : score >= 58 ? 'warn' : 'fail',
+                text: !hasCriticalFailure && score >= 72 && gpuScore >= 65 ? 'reálné' : score >= 58 ? 'na hraně' : 'spíš ne',
+            },
+            {
+                label: '1080p High',
+                status: !hasCriticalFailure && score >= 88 && gpuScore >= 88 && vramScore >= 85 ? 'good' : score >= 72 ? 'warn' : 'fail',
+                text: !hasCriticalFailure && score >= 88 && gpuScore >= 88 && vramScore >= 85 ? 'ano' : score >= 72 ? 's ústupky' : 'ne',
+            },
+            {
+                label: '30 FPS',
+                status: !hasCriticalFailure && score >= 58 && gpuScore >= 45 && cpuScore >= 45 ? 'good' : score >= 44 ? 'warn' : 'fail',
+                text: !hasCriticalFailure && score >= 58 && gpuScore >= 45 && cpuScore >= 45 ? 'realistické' : score >= 44 ? 'nejisté' : 'spíš ne',
+            },
+            {
+                label: '60 FPS',
+                status: !hasCriticalFailure && score >= 82 && gpuScore >= 75 && cpuScore >= 75 ? 'good' : score >= 62 ? 'warn' : 'fail',
+                text: !hasCriticalFailure && score >= 82 && gpuScore >= 75 && cpuScore >= 75 ? 'pravděpodobné' : score >= 62 ? 'nejisté' : 'nepravděpodobné',
+            },
+        ];
+    }
+
+    function buildRecommendations(score, rows, profile, criticalFailures) {
+        const recommendations = [];
+        const byId = Object.fromEntries(rows.map((row) => [row.id, row]));
+        const weakRows = rows
+            .filter((row) => row.score != null && row.score < 76)
+            .sort((a, b) => (a.score || 0) - (b.score || 0));
+
+        if (criticalFailures.length) {
+            recommendations.push(`Největší problém: ${criticalFailures.map((row) => row.label).join(', ')}.`);
+        } else if (weakRows.length) {
+            recommendations.push(`Nejslabší místo: ${weakRows[0].label}.`);
+        } else {
+            recommendations.push('Hardware je vyrovnaný vůči požadavkům hry.');
+        }
+
+        if (byId.gpu?.status !== 'good' || profile.gpu.integrated) {
+            recommendations.push('Začni na nižších detailech a zapni FSR, XeSS nebo DLSS, pokud je hra nabízí.');
+        }
+
+        if (byId.vram?.status === 'fail') {
+            recommendations.push('Sniž kvalitu textur, protože VRAM je pod minimem.');
+        } else if (byId.vram?.status === 'warn') {
+            recommendations.push('Textury drž spíš na low/medium, ať hra neškube při načítání scén.');
+        }
+
+        if (byId.ram?.status !== 'good' && byId.ram) {
+            recommendations.push('Před hraním zavři prohlížeč a náročné aplikace na pozadí.');
+        }
+
+        if (byId.ssd?.status === 'fail') {
+            recommendations.push('Instalace na SSD bude pravděpodobně nutná nebo silně doporučená.');
+        }
+
+        if (score < 60) {
+            recommendations.push('Před nákupem zvaž demo, gameplay test na podobném hardwaru nebo refund okno Steamu.');
+        }
+
+        return recommendations.slice(0, 4);
     }
 
     function normalizeRequirementBlock(block) {
@@ -1284,7 +1453,22 @@
         return levels.length ? Math.min(...levels) : null;
     }
 
-    function renderMissingProfileCard(requirements) {
+    function renderProfileSwitcher(profiles, activeProfile, id) {
+        const items = profiles.items || [];
+        if (!items.length) {
+            return '';
+        }
+
+        return `
+            <select id="${escapeHtml(id)}" class="steam-hw-profile-select" title="Vybrat HW profil">
+                ${items.map((item) => `
+                    <option value="${escapeHtml(item.id)}" ${item.id === activeProfile.id ? 'selected' : ''}>${escapeHtml(item.name || 'HW profil')}</option>
+                `).join('')}
+            </select>
+        `;
+    }
+
+    function renderMissingProfileCard(requirements, profiles, activeProfile) {
         return `
             <div class="steam-hw-card">
                 <div class="steam-hw-header">
@@ -1293,16 +1477,26 @@
                         <div class="steam-hw-title">Steam-HW</div>
                         <div class="steam-hw-subtitle">${escapeHtml(requirements.gameTitle)} - profil hardwaru není uložen</div>
                     </div>
+                    ${renderProfileSwitcher(profiles, activeProfile, 'steam-hw-card-profile-select')}
                     <button type="button" class="steam-hw-button steam-hw-button-primary" data-steam-hw-action="open-settings">Nastavení</button>
                 </div>
-                <p class="steam-hw-muted">Vlož systémové informace ze Steam klienta a skript tady začne porovnávat tvůj hardware s požadavky hry.</p>
+                <p class="steam-hw-muted">Vlož systémové informace ze Steam klienta a skript tady začne porovnávat tvůj hardware s požadavky hry. Uložení probíhá do cookies této stránky.</p>
             </div>
         `;
     }
 
-    function renderEvaluationCard(requirements, profile, evaluation, options) {
+    function renderEvaluationCard(requirements, profile, evaluation, options, profiles, activeProfile) {
         const rows = evaluation.rows.map((row) => renderEvaluationRow(row)).join('');
         const cardClass = options.compactDisplay ? 'steam-hw-card steam-hw-compact' : 'steam-hw-card';
+        const scenarios = evaluation.scenarios.map((scenario) => `
+            <div class="steam-hw-scenario ${escapeHtml(scenario.status)}">
+                <strong>${escapeHtml(scenario.label)}</strong>
+                <span>${escapeHtml(scenario.text)}</span>
+            </div>
+        `).join('');
+        const recommendations = evaluation.recommendations.length
+            ? `<div class="steam-hw-recommendations">${evaluation.recommendations.map((item) => `<div>${escapeHtml(item)}</div>`).join('')}</div>`
+            : '';
         const warnings = profile.warnings.length
             ? `<div class="steam-hw-warnings">${profile.warnings.map((warning) => `<div>${escapeHtml(warning)}</div>`).join('')}</div>`
             : '';
@@ -1319,6 +1513,7 @@
                         <div class="steam-hw-subtitle">${escapeHtml(requirements.gameTitle)} - odhad hratelnosti</div>
                     </div>
                     <div class="steam-hw-actions">
+                        ${renderProfileSwitcher(profiles, activeProfile, 'steam-hw-card-profile-select')}
                         <button type="button" class="steam-hw-toggle-button ${options.compactDisplay ? 'active' : ''}" data-steam-hw-action="toggle-compact" aria-pressed="${options.compactDisplay ? 'true' : 'false'}" title="Přepnout kompaktní zobrazení">Kompakt</button>
                         <button type="button" class="steam-hw-icon-button" data-steam-hw-action="refresh" title="Přepočítat">↻</button>
                         <button type="button" class="steam-hw-button" data-steam-hw-action="open-settings">Nastavení</button>
@@ -1335,8 +1530,10 @@
                     <div class="steam-hw-meter-fill ${escapeHtml(evaluation.verdict.className)}" style="width: ${clamp(evaluation.score, 0, 100)}%"></div>
                 </div>
                 <div class="steam-hw-profile-summary">
-                    ${escapeHtml(profile.cpu.name || 'CPU nenalezeno')} · ${escapeHtml(profile.gpu.name || 'GPU nenalezeno')} · ${escapeHtml(formatMb(profile.memory.ramMb))}
+                    ${escapeHtml(activeProfile.name || 'HW profil')}: ${escapeHtml(profile.cpu.name || 'CPU nenalezeno')} · ${escapeHtml(profile.gpu.name || 'GPU nenalezeno')} · ${escapeHtml(formatMb(profile.memory.ramMb))}
                 </div>
+                <div class="steam-hw-scenarios">${scenarios}</div>
+                ${recommendations}
                 <div class="steam-hw-grid">${rows}</div>
                 ${warnings}
                 ${technical}
@@ -1366,11 +1563,167 @@
         `;
     }
 
+    function renderPurchaseWarning(evaluation, requirements) {
+        removePurchaseWarning();
+        if (!evaluation || !requirements) {
+            return;
+        }
+
+        const shouldWarn = evaluation.criticalFailures.length || evaluation.score < 62;
+        if (!shouldWarn) {
+            return;
+        }
+
+        const target = document.querySelector('.game_area_purchase_game_wrapper, .game_area_purchase, #game_area_purchase');
+        if (!target || target.querySelector('#steam-hw-purchase-warning')) {
+            return;
+        }
+
+        const warning = document.createElement('div');
+        warning.id = 'steam-hw-purchase-warning';
+        warning.className = `steam-hw-buy-warning ${evaluation.criticalFailures.length ? 'fail' : 'warn'}`;
+        warning.innerHTML = `
+            <strong>Steam-HW nákupní upozornění</strong>
+            <span>${escapeHtml(evaluation.verdict.text)}</span>
+            <button type="button" class="steam-hw-button" data-steam-hw-action="open-settings">Upravit HW profil</button>
+        `;
+        target.insertBefore(warning, target.firstChild);
+    }
+
+    function removePurchaseWarning() {
+        const warning = document.getElementById('steam-hw-purchase-warning');
+        if (warning) {
+            warning.remove();
+        }
+    }
+
+    function scheduleBadgeScan() {
+        window.clearTimeout(badgeScanTimer);
+        badgeScanTimer = window.setTimeout(scanAppBadges, 350);
+    }
+
+    function scanAppBadges() {
+        const options = readOptions();
+        if (!options.showStoreBadges) {
+            document.querySelectorAll('.steam-hw-app-badge').forEach((badge) => badge.remove());
+            document.querySelectorAll('[data-steam-hw-badge-bound]').forEach((element) => {
+                delete element.dataset.steamHwBadgeBound;
+            });
+            return;
+        }
+
+        const activeProfile = getActiveProfile(readProfiles());
+        if (!activeProfile.text.trim()) {
+            return;
+        }
+
+        const seenAppIds = new Set();
+        const candidates = Array.from(document.querySelectorAll('[data-ds-appid], a[href*="/app/"]'))
+            .map((element) => ({ element, appId: extractAppId(element) }))
+            .filter((item) => {
+                if (!item.appId || item.element.dataset.steamHwBadgeBound || seenAppIds.has(item.appId)) {
+                    return false;
+                }
+                seenAppIds.add(item.appId);
+                return true;
+            })
+            .slice(0, BADGE_FETCH_LIMIT);
+
+        candidates.forEach(({ element, appId }) => {
+            element.dataset.steamHwBadgeBound = '1';
+            const badge = createAppBadge('HW...', 'unknown');
+            attachAppBadge(element, badge);
+            evaluateAppBadge(appId, badge);
+        });
+    }
+
+    function extractAppId(element) {
+        const datasetId = element.getAttribute('data-ds-appid') || element.dataset?.dsAppid;
+        if (datasetId) {
+            const first = String(datasetId).split(',')[0].trim();
+            if (/^\d+$/.test(first)) {
+                return first;
+            }
+        }
+
+        const href = element.getAttribute('href') || element.querySelector?.('a[href*="/app/"]')?.getAttribute('href') || '';
+        const match = href.match(/\/app\/(\d+)/);
+        return match ? match[1] : '';
+    }
+
+    function createAppBadge(label, status) {
+        const badge = document.createElement('span');
+        badge.className = `steam-hw-app-badge ${status}`;
+        badge.textContent = label;
+        return badge;
+    }
+
+    function attachAppBadge(element, badge) {
+        const container = element.closest('.search_result_row, .wishlist_row, .tab_item, .recommendation_highlight, [data-ds-appid]') || element;
+        if (container.querySelector?.('.steam-hw-app-badge')) {
+            return;
+        }
+        container.classList.add('steam-hw-badge-host');
+        container.appendChild(badge);
+    }
+
+    function evaluateAppBadge(appId, badge) {
+        getAppRequirements(appId)
+            .then((requirements) => {
+                if (!requirements) {
+                    setBadgeState(badge, 'HW ?', 'unknown', 'Požadavky se nepodařilo najít.');
+                    return;
+                }
+
+                const options = readOptions();
+                const activeProfile = getActiveProfile(readProfiles());
+                const profile = parseSteamHardwareProfile(activeProfile.text, options, activeProfile);
+                const evaluation = evaluateProfile(requirements, profile, options);
+                const status = evaluation.criticalFailures.length || evaluation.score < 45
+                    ? 'fail'
+                    : evaluation.score < 70
+                        ? 'warn'
+                        : 'good';
+                const label = status === 'good' ? 'HW OK' : status === 'warn' ? 'HW Low' : 'HW Risk';
+                setBadgeState(badge, label, status, `${requirements.gameTitle}: ${evaluation.verdict.title} (${evaluation.score} %)`);
+            })
+            .catch(() => setBadgeState(badge, 'HW ?', 'unknown', 'Kontrola selhala.'));
+    }
+
+    function setBadgeState(badge, label, status, title) {
+        badge.textContent = label;
+        badge.className = `steam-hw-app-badge ${status}`;
+        badge.title = title || label;
+    }
+
+    function getAppRequirements(appId) {
+        if (appRequirementCache.has(appId)) {
+            return Promise.resolve(appRequirementCache.get(appId));
+        }
+
+        return fetch(`/app/${appId}/?l=czech`, { credentials: 'include' })
+            .then((response) => response.ok ? response.text() : '')
+            .then((html) => {
+                if (!html) {
+                    appRequirementCache.set(appId, null);
+                    return null;
+                }
+                const doc = new DOMParser().parseFromString(html, 'text/html');
+                const requirements = parseRequirementsFromPage(doc);
+                appRequirementCache.set(appId, requirements);
+                return requirements;
+            });
+    }
+
     function openSettingsDialog() {
         closeSettingsDialog();
 
         const options = readOptions();
-        const profileText = readProfileText();
+        const profiles = readProfiles();
+        const activeProfile = getActiveProfile(profiles);
+        const profileText = activeProfile.text || '';
+        const overrides = normalizeOverrides(activeProfile.overrides);
+        const survey = readSurveyCache();
         const modal = document.createElement('div');
         modal.id = 'steam-hw-modal';
         modal.innerHTML = `
@@ -1379,11 +1732,50 @@
                 <div class="steam-hw-dialog-header">
                     <div>
                         <div id="steam-hw-dialog-title" class="steam-hw-dialog-title">Steam-HW nastavení</div>
-                        <div class="steam-hw-muted">Vlož sem systémové informace z klienta Steam.</div>
+                        <div class="steam-hw-muted">Profily a ruční opravy se ukládají do cookies domény store.steampowered.com.</div>
                     </div>
                     <button type="button" class="steam-hw-icon-button" data-steam-hw-action="close-settings" title="Zavřít">×</button>
                 </div>
+                <div class="steam-hw-onboarding">
+                    <strong>Import ze Steamu</strong>
+                    <span>Steam klient → Nápověda → Systémové informace → zkopírovat vše → vložit sem.</span>
+                    <span>Data zůstávají lokálně v prohlížeči; skript je nikam neposílá, ale cookies se technicky posílají serveru Steam při požadavcích na store.steampowered.com.</span>
+                </div>
+                <div class="steam-hw-profile-tools">
+                    <label>
+                        <span>Profil</span>
+                        ${renderProfileSwitcher(profiles, activeProfile, 'steam-hw-profile-select')}
+                    </label>
+                    <label>
+                        <span>Název profilu</span>
+                        <input id="steam-hw-profile-name" class="steam-hw-input" type="text" value="${escapeHtml(activeProfile.name || '')}" placeholder="Např. Můj notebook">
+                    </label>
+                    <div class="steam-hw-profile-buttons">
+                        <button type="button" class="steam-hw-button" data-steam-hw-action="profile-new">Nový</button>
+                        <button type="button" class="steam-hw-button" data-steam-hw-action="profile-duplicate">Duplikovat</button>
+                        <button type="button" class="steam-hw-button steam-hw-button-danger" data-steam-hw-action="profile-delete">Smazat profil</button>
+                    </div>
+                </div>
                 <textarea id="steam-hw-profile-input" class="steam-hw-textarea" spellcheck="false" placeholder="${escapeHtml(settingsPlaceholder())}">${escapeHtml(profileText)}</textarea>
+                <div class="steam-hw-overrides">
+                    <div class="steam-hw-section-title">Ruční opravy porovnání</div>
+                    <label>
+                        <span>CPU počítat jako</span>
+                        <input id="steam-hw-override-cpu" class="steam-hw-input" type="text" value="${escapeHtml(overrides.cpuAs)}" placeholder="Např. Core i5-12600K">
+                    </label>
+                    <label>
+                        <span>GPU počítat jako</span>
+                        <input id="steam-hw-override-gpu" class="steam-hw-input" type="text" value="${escapeHtml(overrides.gpuAs)}" placeholder="Např. GeForce RTX 3060">
+                    </label>
+                    <label>
+                        <span>VRAM ručně (GB)</span>
+                        <input id="steam-hw-override-vram" class="steam-hw-input" type="number" min="0" step="0.5" value="${overrides.vramMb ? escapeHtml(formatNumberInput(overrides.vramMb / 1024)) : ''}">
+                    </label>
+                    <label>
+                        <span>RAM ručně (GB)</span>
+                        <input id="steam-hw-override-ram" class="steam-hw-input" type="number" min="0" step="0.5" value="${overrides.ramMb ? escapeHtml(formatNumberInput(overrides.ramMb / 1024)) : ''}">
+                    </label>
+                </div>
                 <div class="steam-hw-options">
                     <label>
                         <input id="steam-hw-option-vram" type="checkbox" ${options.useAdvertisedVram ? 'checked' : ''}>
@@ -1397,6 +1789,21 @@
                         <input id="steam-hw-option-compact" type="checkbox" ${options.compactDisplay ? 'checked' : ''}>
                         Použít kompaktnější zobrazení výsledku
                     </label>
+                    <label>
+                        <input id="steam-hw-option-survey" type="checkbox" ${options.useSteamSurvey ? 'checked' : ''}>
+                        Používat Steam HW Survey jako pomocný seznam názvů hardwaru
+                    </label>
+                    <label>
+                        <input id="steam-hw-option-badges" type="checkbox" ${options.showStoreBadges ? 'checked' : ''}>
+                        Zobrazovat malé HW badge ve vyhledávání, wishlistu a seznamech her
+                    </label>
+                </div>
+                <div class="steam-hw-survey-box">
+                    <div>
+                        <strong>Steam HW Survey cache</strong>
+                        <span id="steam-hw-survey-status">${escapeHtml(describeSurveyCache(survey))}</span>
+                    </div>
+                    <button type="button" class="steam-hw-button" data-steam-hw-action="refresh-survey">Aktualizovat</button>
                 </div>
                 <div id="steam-hw-settings-preview" class="steam-hw-preview"></div>
                 <div class="steam-hw-dialog-actions">
@@ -1428,29 +1835,39 @@
         const vram = document.getElementById('steam-hw-option-vram');
         const scores = document.getElementById('steam-hw-option-scores');
         const compact = document.getElementById('steam-hw-option-compact');
+        const survey = document.getElementById('steam-hw-option-survey');
+        const badges = document.getElementById('steam-hw-option-badges');
 
         if (!input) {
             return;
         }
 
-        writeProfileText(input.value);
+        saveCurrentDialogProfile();
         writeOptions({
             useAdvertisedVram: Boolean(vram?.checked),
             showTechnicalScores: Boolean(scores?.checked),
             compactDisplay: Boolean(compact?.checked),
+            useSteamSurvey: Boolean(survey?.checked),
+            showStoreBadges: Boolean(badges?.checked),
         });
 
         closeSettingsDialog();
         notify('Steam-HW', 'HW profil byl uložen.');
         renderPageAnalysis(true);
+        scheduleBadgeScan();
     }
 
     function clearSettingsDialog() {
         deleteStoredValue(SCRIPT.profileKey);
+        deleteStoredValue(SCRIPT.profilesKey);
         const input = document.getElementById('steam-hw-profile-input');
+        const name = document.getElementById('steam-hw-profile-name');
         if (input) {
             input.value = '';
             updateSettingsPreview('');
+        }
+        if (name) {
+            name.value = 'Můj počítač';
         }
         renderPageAnalysis(true);
         notify('Steam-HW', 'HW profil byl vymazán.');
@@ -1462,7 +1879,7 @@
             return;
         }
 
-        const profile = parseSteamHardwareProfile(value || '', readOptions());
+        const profile = parseSteamHardwareProfile(value || '', readOptions(), { overrides: readDialogOverrides() });
         if (!value.trim()) {
             preview.innerHTML = '<div class="steam-hw-muted">Náhled profilu se zobrazí po vložení systémových informací.</div>';
             return;
@@ -1512,12 +1929,216 @@
             requirementNode;
     }
 
+    function createProfileRecord(name, textValue = '', overrides = {}) {
+        const now = new Date().toISOString();
+        return {
+            id: `profile-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+            name: cleanText(name) || 'Můj počítač',
+            text: String(textValue || ''),
+            overrides: normalizeOverrides(overrides),
+            createdAt: now,
+            updatedAt: now,
+        };
+    }
+
+    function readProfiles() {
+        const stored = readStoredValue(SCRIPT.profilesKey, null);
+        if (stored && Array.isArray(stored.items)) {
+            const normalized = normalizeProfiles(stored);
+            if (JSON.stringify(stored) !== JSON.stringify(normalized)) {
+                writeProfiles(normalized);
+            }
+            return normalized;
+        }
+
+        const legacyText = String(readStoredValue(SCRIPT.profileKey, '') || '');
+        const firstProfile = createProfileRecord('Můj počítač', legacyText);
+        const profiles = { activeId: firstProfile.id, items: [firstProfile] };
+        writeProfiles(profiles);
+        return profiles;
+    }
+
+    function normalizeProfiles(profiles) {
+        const items = (profiles.items || [])
+            .filter((item) => item && typeof item === 'object')
+            .map((item, index) => ({
+                id: cleanText(item.id || `profile-${index + 1}`),
+                name: cleanText(item.name || `HW profil ${index + 1}`),
+                text: String(item.text || ''),
+                overrides: normalizeOverrides(item.overrides),
+                createdAt: item.createdAt || new Date().toISOString(),
+                updatedAt: item.updatedAt || item.createdAt || new Date().toISOString(),
+            }));
+
+        if (!items.length) {
+            items.push(createProfileRecord('Můj počítač'));
+        }
+
+        const activeId = items.some((item) => item.id === profiles.activeId) ? profiles.activeId : items[0].id;
+        return { activeId, items };
+    }
+
+    function writeProfiles(profiles) {
+        writeStoredValue(SCRIPT.profilesKey, normalizeProfiles(profiles));
+    }
+
+    function getActiveProfile(profiles = readProfiles()) {
+        return profiles.items.find((item) => item.id === profiles.activeId) || profiles.items[0];
+    }
+
+    function setActiveProfileId(profileId) {
+        const profiles = readProfiles();
+        if (!profiles.items.some((item) => item.id === profileId)) {
+            return;
+        }
+        profiles.activeId = profileId;
+        writeProfiles(profiles);
+    }
+
+    function normalizeOverrides(overrides = {}) {
+        return {
+            cpuAs: cleanText(overrides.cpuAs || ''),
+            gpuAs: cleanText(overrides.gpuAs || ''),
+            vramMb: normalizeOverrideMb(overrides.vramMb),
+            ramMb: normalizeOverrideMb(overrides.ramMb),
+        };
+    }
+
+    function normalizeOverrideMb(value) {
+        const number = Number(value);
+        return Number.isFinite(number) && number > 0 ? Math.round(number) : null;
+    }
+
+    function readDialogOverrides() {
+        const vramGb = parseFloat(String(document.getElementById('steam-hw-override-vram')?.value || '').replace(',', '.'));
+        const ramGb = parseFloat(String(document.getElementById('steam-hw-override-ram')?.value || '').replace(',', '.'));
+        return normalizeOverrides({
+            cpuAs: document.getElementById('steam-hw-override-cpu')?.value || '',
+            gpuAs: document.getElementById('steam-hw-override-gpu')?.value || '',
+            vramMb: Number.isFinite(vramGb) && vramGb > 0 ? vramGb * 1024 : null,
+            ramMb: Number.isFinite(ramGb) && ramGb > 0 ? ramGb * 1024 : null,
+        });
+    }
+
+    function saveCurrentDialogProfile(profileIdOverride) {
+        const selector = document.getElementById('steam-hw-profile-select');
+        const input = document.getElementById('steam-hw-profile-input');
+        const name = document.getElementById('steam-hw-profile-name');
+        const profiles = readProfiles();
+        const profileId = profileIdOverride || selector?.value || profiles.activeId;
+        const profile = profiles.items.find((item) => item.id === profileId) || getActiveProfile(profiles);
+
+        profile.name = cleanText(name?.value || profile.name || 'Můj počítač');
+        profile.text = String(input?.value || '');
+        profile.overrides = readDialogOverrides();
+        profile.updatedAt = new Date().toISOString();
+        profiles.activeId = profile.id;
+        writeProfiles(profiles);
+        writeStoredValue(SCRIPT.profileKey, profile.text);
+        return profile;
+    }
+
+    function switchSettingsProfile(profileId) {
+        saveCurrentDialogProfile(readProfiles().activeId);
+        setActiveProfileId(profileId);
+        loadSettingsProfile(profileId);
+    }
+
+    function loadSettingsProfile(profileId) {
+        if (profileId) {
+            setActiveProfileId(profileId);
+        }
+        const profiles = readProfiles();
+        const profile = getActiveProfile(profiles);
+        const overrides = normalizeOverrides(profile.overrides);
+        const selector = document.getElementById('steam-hw-profile-select');
+        const name = document.getElementById('steam-hw-profile-name');
+        const input = document.getElementById('steam-hw-profile-input');
+        if (selector) {
+            selector.value = profile.id;
+        }
+        if (name) {
+            name.value = profile.name || '';
+        }
+        if (input) {
+            input.value = profile.text || '';
+        }
+        setInputValue('steam-hw-override-cpu', overrides.cpuAs);
+        setInputValue('steam-hw-override-gpu', overrides.gpuAs);
+        setInputValue('steam-hw-override-vram', overrides.vramMb ? formatNumberInput(overrides.vramMb / 1024) : '');
+        setInputValue('steam-hw-override-ram', overrides.ramMb ? formatNumberInput(overrides.ramMb / 1024) : '');
+        updateSettingsPreview(profile.text || '');
+    }
+
+    function createProfileFromDialog() {
+        saveCurrentDialogProfile();
+        const profiles = readProfiles();
+        const profile = createProfileRecord(`HW profil ${profiles.items.length + 1}`);
+        profiles.items.push(profile);
+        profiles.activeId = profile.id;
+        writeProfiles(profiles);
+        refreshSettingsDialogProfiles();
+        loadSettingsProfile(profile.id);
+    }
+
+    function duplicateProfileFromDialog() {
+        const source = saveCurrentDialogProfile();
+        const profiles = readProfiles();
+        const profile = createProfileRecord(`${source.name || 'HW profil'} kopie`, source.text, source.overrides);
+        profiles.items.push(profile);
+        profiles.activeId = profile.id;
+        writeProfiles(profiles);
+        refreshSettingsDialogProfiles();
+        loadSettingsProfile(profile.id);
+    }
+
+    function deleteProfileFromDialog() {
+        const profiles = readProfiles();
+        const selector = document.getElementById('steam-hw-profile-select');
+        const profileId = selector?.value || profiles.activeId;
+        if (profiles.items.length <= 1) {
+            profiles.items[0] = createProfileRecord('Můj počítač');
+            profiles.activeId = profiles.items[0].id;
+        } else {
+            profiles.items = profiles.items.filter((item) => item.id !== profileId);
+            profiles.activeId = profiles.items[0].id;
+        }
+        writeProfiles(profiles);
+        refreshSettingsDialogProfiles();
+        loadSettingsProfile(profiles.activeId);
+        renderPageAnalysis(true);
+    }
+
+    function refreshSettingsDialogProfiles() {
+        const oldSelector = document.getElementById('steam-hw-profile-select');
+        if (!oldSelector) {
+            return;
+        }
+        const profiles = readProfiles();
+        const active = getActiveProfile(profiles);
+        const wrapper = document.createElement('div');
+        wrapper.innerHTML = renderProfileSwitcher(profiles, active, 'steam-hw-profile-select');
+        oldSelector.replaceWith(wrapper.firstElementChild);
+    }
+
+    function setInputValue(id, value) {
+        const input = document.getElementById(id);
+        if (input) {
+            input.value = value || '';
+        }
+    }
+
     function readProfileText() {
-        return String(readStoredValue(SCRIPT.profileKey, '') || '');
+        return String(getActiveProfile(readProfiles()).text || '');
     }
 
     function writeProfileText(value) {
-        writeStoredValue(SCRIPT.profileKey, String(value || ''));
+        const profiles = readProfiles();
+        const profile = getActiveProfile(profiles);
+        profile.text = String(value || '');
+        profile.updatedAt = new Date().toISOString();
+        writeProfiles(profiles);
+        writeStoredValue(SCRIPT.profileKey, profile.text);
     }
 
     function toggleCompactDisplay() {
@@ -1539,45 +2160,61 @@
     }
 
     function readStoredValue(key, fallback) {
+        const cookieValue = readCookieStoredValue(key);
+        if (cookieValue.found) {
+            return cookieValue.value;
+        }
+
+        let legacyValue = fallback;
+        let foundLegacy = false;
+
         try {
             if (typeof GM_getValue === 'function') {
-                return GM_getValue(key, fallback);
+                legacyValue = GM_getValue(key, fallback);
+                foundLegacy = legacyValue !== fallback;
             }
         } catch (error) {
             console.warn(`${SCRIPT.name}: GM_getValue selhalo`, error);
         }
 
-        try {
-            const localValue = window.localStorage.getItem(key);
-            return localValue == null ? fallback : JSON.parse(localValue);
-        } catch (error) {
-            console.warn(`${SCRIPT.name}: localStorage čtení selhalo`, error);
-            return fallback;
+        if (!foundLegacy) {
+            try {
+                const localValue = window.localStorage.getItem(key);
+                if (localValue != null) {
+                    legacyValue = JSON.parse(localValue);
+                    foundLegacy = true;
+                }
+            } catch (error) {
+                console.warn(`${SCRIPT.name}: localStorage čtení selhalo`, error);
+            }
         }
+
+        if (foundLegacy) {
+            writeCookieStoredValue(key, legacyValue);
+            return legacyValue;
+        }
+
+        return fallback;
     }
 
     function writeStoredValue(key, value) {
+        writeCookieStoredValue(key, value);
+
         try {
             if (typeof GM_setValue === 'function') {
                 GM_setValue(key, value);
-                return;
             }
         } catch (error) {
             console.warn(`${SCRIPT.name}: GM_setValue selhalo`, error);
         }
-
-        try {
-            window.localStorage.setItem(key, JSON.stringify(value));
-        } catch (error) {
-            console.warn(`${SCRIPT.name}: localStorage zápis selhal`, error);
-        }
     }
 
     function deleteStoredValue(key) {
+        deleteCookieStoredValue(key);
+
         try {
             if (typeof GM_deleteValue === 'function') {
                 GM_deleteValue(key);
-                return;
             }
         } catch (error) {
             console.warn(`${SCRIPT.name}: GM_deleteValue selhalo`, error);
@@ -1588,6 +2225,207 @@
         } catch (error) {
             console.warn(`${SCRIPT.name}: localStorage mazání selhalo`, error);
         }
+    }
+
+    function readCookieStoredValue(key) {
+        try {
+            const base = cookieBaseName(key);
+            const countRaw = readCookie(`${base}_count`);
+            if (!countRaw) {
+                return { found: false, value: null };
+            }
+
+            const count = Number(countRaw);
+            if (!Number.isInteger(count) || count < 1 || count > COOKIE_MAX_CHUNKS) {
+                deleteCookieStoredValue(key);
+                return { found: false, value: null };
+            }
+
+            let encoded = '';
+            for (let index = 0; index < count; index += 1) {
+                const chunk = readCookie(`${base}_${index}`);
+                if (chunk == null) {
+                    return { found: false, value: null };
+                }
+                encoded += chunk;
+            }
+
+            return { found: true, value: JSON.parse(decodeURIComponent(encoded)) };
+        } catch (error) {
+            console.warn(`${SCRIPT.name}: cookie čtení selhalo`, error);
+            return { found: false, value: null };
+        }
+    }
+
+    function writeCookieStoredValue(key, value) {
+        try {
+            const base = cookieBaseName(key);
+            const encoded = encodeURIComponent(JSON.stringify(value));
+            const chunks = [];
+            for (let index = 0; index < encoded.length; index += COOKIE_CHUNK_SIZE) {
+                chunks.push(encoded.slice(index, index + COOKIE_CHUNK_SIZE));
+            }
+
+            if (chunks.length > COOKIE_MAX_CHUNKS) {
+                console.warn(`${SCRIPT.name}: hodnota ${key} je příliš velká pro cookie úložiště`);
+                return;
+            }
+
+            deleteCookieStoredValue(key);
+            setCookie(`${base}_count`, String(chunks.length));
+            chunks.forEach((chunk, index) => setCookie(`${base}_${index}`, chunk));
+        } catch (error) {
+            console.warn(`${SCRIPT.name}: cookie zápis selhal`, error);
+        }
+    }
+
+    function deleteCookieStoredValue(key) {
+        const base = cookieBaseName(key);
+        expireCookie(`${base}_count`);
+        for (let index = 0; index < COOKIE_MAX_CHUNKS; index += 1) {
+            expireCookie(`${base}_${index}`);
+        }
+    }
+
+    function cookieBaseName(key) {
+        return `${SCRIPT.cookiePrefix}${String(key).replace(/[^a-z0-9]+/ig, '_')}`;
+    }
+
+    function readCookie(name) {
+        const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const match = document.cookie.match(new RegExp(`(?:^|; )${escaped}=([^;]*)`));
+        return match ? match[1] : null;
+    }
+
+    function setCookie(name, value) {
+        const secure = location.protocol === 'https:' ? '; Secure' : '';
+        document.cookie = `${name}=${value}; Max-Age=${COOKIE_MAX_AGE_SECONDS}; Path=/; SameSite=Lax${secure}`;
+    }
+
+    function expireCookie(name) {
+        const secure = location.protocol === 'https:' ? '; Secure' : '';
+        document.cookie = `${name}=; Max-Age=0; Path=/; SameSite=Lax${secure}`;
+    }
+
+    function readSurveyCache() {
+        const cache = readStoredValue(SCRIPT.surveyKey, null);
+        if (!cache || typeof cache !== 'object') {
+            return { updatedAt: 0, month: '', gpuNames: [], osNames: [], ramNames: [] };
+        }
+        return {
+            updatedAt: Number(cache.updatedAt) || 0,
+            month: cleanText(cache.month || ''),
+            gpuNames: Array.isArray(cache.gpuNames) ? cache.gpuNames.slice(0, 500) : [],
+            osNames: Array.isArray(cache.osNames) ? cache.osNames.slice(0, 120) : [],
+            ramNames: Array.isArray(cache.ramNames) ? cache.ramNames.slice(0, 80) : [],
+        };
+    }
+
+    function describeSurveyCache(cache = readSurveyCache()) {
+        if (!cache.updatedAt) {
+            return 'zatím není stažena';
+        }
+        const date = new Date(cache.updatedAt);
+        const dateText = Number.isNaN(date.getTime()) ? 'neznámé datum' : date.toLocaleDateString('cs-CZ');
+        return `${cache.month || 'Steam HW Survey'} · ${cache.gpuNames.length} GPU názvů · aktualizováno ${dateText}`;
+    }
+
+    function refreshSurveyCacheIfNeeded() {
+        const options = readOptions();
+        const cache = readSurveyCache();
+        if (!options.useSteamSurvey || Date.now() - cache.updatedAt < SURVEY_REFRESH_MS) {
+            return;
+        }
+        refreshSurveyCache(false);
+    }
+
+    function refreshSurveyCache(force) {
+        if (surveyRefreshInFlight) {
+            return surveyRefreshInFlight;
+        }
+
+        const cache = readSurveyCache();
+        if (!force && Date.now() - cache.updatedAt < SURVEY_REFRESH_MS) {
+            return Promise.resolve(cache);
+        }
+
+        surveyRefreshInFlight = fetch('/hwsurvey/?l=english', { credentials: 'include' })
+            .then((response) => {
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+                return response.text();
+            })
+            .then((html) => {
+                const parsed = parseHardwareSurvey(html);
+                writeStoredValue(SCRIPT.surveyKey, parsed);
+                updateSurveyStatus(parsed);
+                notify('Steam-HW', `Steam HW Survey cache aktualizována (${parsed.gpuNames.length} GPU názvů).`);
+                return parsed;
+            })
+            .catch((error) => {
+                console.warn(`${SCRIPT.name}: Steam HW Survey se nepodařilo stáhnout`, error);
+                if (force) {
+                    notify('Steam-HW', 'Steam HW Survey se nepodařilo aktualizovat.');
+                }
+                return cache;
+            })
+            .finally(() => {
+                surveyRefreshInFlight = null;
+            });
+
+        return surveyRefreshInFlight;
+    }
+
+    function updateSurveyStatus(cache = readSurveyCache()) {
+        const status = document.getElementById('steam-hw-survey-status');
+        if (status) {
+            status.textContent = describeSurveyCache(cache);
+        }
+    }
+
+    function parseHardwareSurvey(html) {
+        const doc = new DOMParser().parseFromString(html, 'text/html');
+        const pageText = cleanSurveyText(doc.body?.textContent || '');
+        const lines = uniqueValues(pageText.split('\n').map(cleanText).filter(Boolean));
+        const heading = cleanText(doc.querySelector('h1')?.textContent || '');
+        const monthMatch = pageText.match(/Steam Hardware & Software Survey:\s*([^\n]+)/i);
+
+        return {
+            updatedAt: Date.now(),
+            month: cleanText(monthMatch?.[1] || heading || 'Steam HW Survey'),
+            gpuNames: lines.filter(looksLikeSurveyGpuName).slice(0, 500),
+            osNames: lines.filter((line) => /^(windows|macos|ubuntu|arch linux|linux mint|fedora|debian|manjaro)/i.test(line)).slice(0, 120),
+            ramNames: lines.filter((line) => /^(less than\s*)?\d+\s*gb$|^more than\s*\d+\s*gb$/i.test(line)).slice(0, 80),
+        };
+    }
+
+    function cleanSurveyText(value) {
+        return String(value || '')
+            .replace(/\r/g, '')
+            .replace(/\t+/g, '\n')
+            .replace(/\n{2,}/g, '\n');
+    }
+
+    function looksLikeSurveyGpuName(line) {
+        return /\b(nvidia|geforce|rtx|gtx|radeon|intel\s+(?:arc|uhd|iris|hd)|arc\s+[ab]?\d|vega|amd\s+radeon)\b/i.test(line) &&
+            !/%|change|usage|systems|manufacturer|click|image/i.test(line) &&
+            line.length >= 8 &&
+            line.length <= 90;
+    }
+
+    function uniqueValues(values) {
+        const seen = new Set();
+        const result = [];
+        values.forEach((value) => {
+            const key = normalize(value);
+            if (!key || seen.has(key)) {
+                return;
+            }
+            seen.add(key);
+            result.push(value);
+        });
+        return result;
     }
 
     function notify(title, textValue) {
@@ -1682,7 +2520,31 @@
             .steam-hw-actions {
                 display: flex;
                 flex: 0 0 auto;
+                align-items: center;
                 gap: 8px;
+            }
+
+            .steam-hw-profile-select,
+            .steam-hw-input {
+                box-sizing: border-box;
+                border: 1px solid #3d4450;
+                border-radius: 4px;
+                background: #111820;
+                color: #dfe3e6;
+                font: inherit;
+                min-height: 34px;
+                padding: 6px 9px;
+            }
+
+            .steam-hw-profile-select {
+                max-width: 180px;
+            }
+
+            .steam-hw-input:focus,
+            .steam-hw-profile-select:focus {
+                border-color: #66c0f4;
+                box-shadow: 0 0 0 2px rgba(102, 192, 244, 0.22);
+                outline: none;
             }
 
             .steam-hw-button,
@@ -1806,6 +2668,57 @@
                 background: #ff7b72;
             }
 
+            .steam-hw-scenarios {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
+                gap: 6px;
+                margin-top: 10px;
+            }
+
+            .steam-hw-scenario {
+                border-radius: 4px;
+                padding: 7px 8px;
+                background: rgba(255, 255, 255, 0.07);
+            }
+
+            .steam-hw-scenario strong,
+            .steam-hw-scenario span {
+                display: block;
+            }
+
+            .steam-hw-scenario strong {
+                color: #ffffff;
+                font-size: 12px;
+            }
+
+            .steam-hw-scenario span {
+                color: #c8d2da;
+                font-size: 12px;
+            }
+
+            .steam-hw-scenario.good {
+                border-left: 3px solid #a4d007;
+            }
+
+            .steam-hw-scenario.warn {
+                border-left: 3px solid #f3c15d;
+            }
+
+            .steam-hw-scenario.fail {
+                border-left: 3px solid #ff7b72;
+            }
+
+            .steam-hw-recommendations {
+                display: grid;
+                gap: 5px;
+                margin-top: 10px;
+                padding: 9px 10px;
+                border-left: 3px solid #66c0f4;
+                background: rgba(102, 192, 244, 0.10);
+                color: #dfe3e6;
+                font-size: 12px;
+            }
+
             .steam-hw-grid {
                 display: grid;
                 grid-template-columns: 1fr;
@@ -1872,6 +2785,20 @@
                 grid-template-columns: repeat(auto-fit, minmax(245px, 1fr));
                 gap: 6px;
                 margin-top: 8px;
+            }
+
+            .steam-hw-card.steam-hw-compact .steam-hw-scenarios {
+                grid-template-columns: repeat(auto-fit, minmax(112px, 1fr));
+                margin-top: 6px;
+            }
+
+            .steam-hw-card.steam-hw-compact .steam-hw-scenario {
+                padding: 5px 6px;
+            }
+
+            .steam-hw-card.steam-hw-compact .steam-hw-recommendations {
+                margin-top: 6px;
+                padding: 7px 8px;
             }
 
             .steam-hw-row {
@@ -1975,34 +2902,101 @@
                 font-size: 12px;
             }
 
+            .steam-hw-buy-warning {
+                display: flex;
+                align-items: center;
+                gap: 10px;
+                margin: 0 0 10px;
+                padding: 10px;
+                border-radius: 4px;
+                background: rgba(243, 193, 93, 0.14);
+                color: #f3d59a;
+                font-size: 12px;
+            }
+
+            .steam-hw-buy-warning.fail {
+                background: rgba(255, 123, 114, 0.14);
+                color: #ffaaa4;
+            }
+
+            .steam-hw-buy-warning strong {
+                color: #ffffff;
+                white-space: nowrap;
+            }
+
+            .steam-hw-buy-warning span {
+                flex: 1 1 auto;
+            }
+
+            .steam-hw-badge-host {
+                position: relative;
+            }
+
+            .steam-hw-app-badge {
+                position: absolute;
+                right: 8px;
+                top: 8px;
+                z-index: 4;
+                border-radius: 4px;
+                padding: 3px 6px;
+                background: rgba(15, 23, 31, 0.88);
+                color: #dfe3e6;
+                font-size: 11px;
+                font-weight: 700;
+                line-height: 1.2;
+                pointer-events: none;
+                box-shadow: 0 2px 8px rgba(0, 0, 0, 0.28);
+            }
+
+            .steam-hw-app-badge.good {
+                color: #c7ef49;
+            }
+
+            .steam-hw-app-badge.warn {
+                color: #ffd27a;
+            }
+
+            .steam-hw-app-badge.fail {
+                color: #ffaaa4;
+            }
+
             #steam-hw-modal {
                 position: fixed;
                 inset: 0;
                 z-index: 2147483647;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                box-sizing: border-box;
+                padding: 14px;
+                overflow: hidden;
             }
 
             .steam-hw-modal-backdrop {
-                position: absolute;
+                position: fixed;
                 inset: 0;
                 background: rgba(0, 0, 0, 0.66);
             }
 
             .steam-hw-dialog {
-                position: absolute;
-                left: 50%;
-                top: 50%;
-                transform: translate(-50%, -50%);
+                position: relative;
                 box-sizing: border-box;
-                width: min(860px, calc(100vw - 28px));
-                max-height: min(760px, calc(100vh - 28px));
+                width: min(860px, 100%);
+                max-height: calc(100vh - 28px);
+                max-height: calc(100dvh - 28px);
+                min-height: 0;
                 display: flex;
                 flex-direction: column;
                 gap: 12px;
                 padding: 18px;
+                overflow-x: hidden;
+                overflow-y: auto;
+                overscroll-behavior: contain;
                 border: 1px solid rgba(102, 192, 244, 0.32);
                 border-radius: 6px;
                 background: #20252d;
                 box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+                scrollbar-color: #4d5665 #111820;
             }
 
             .steam-hw-dialog-header {
@@ -2016,10 +3010,81 @@
                 font-weight: 800;
             }
 
+            .steam-hw-onboarding,
+            .steam-hw-survey-box {
+                display: flex;
+                justify-content: space-between;
+                gap: 12px;
+                padding: 10px;
+                border-radius: 4px;
+                background: rgba(102, 192, 244, 0.10);
+                color: #dfe3e6;
+                font-size: 12px;
+            }
+
+            .steam-hw-onboarding {
+                flex-direction: column;
+                gap: 4px;
+            }
+
+            .steam-hw-survey-box strong,
+            .steam-hw-survey-box span {
+                display: block;
+            }
+
+            .steam-hw-survey-box span {
+                color: #acb8c1;
+            }
+
+            .steam-hw-profile-tools,
+            .steam-hw-overrides {
+                display: grid;
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+                gap: 10px;
+            }
+
+            .steam-hw-profile-tools label,
+            .steam-hw-overrides label {
+                display: grid;
+                gap: 4px;
+                min-width: 0;
+            }
+
+            .steam-hw-profile-tools .steam-hw-input,
+            .steam-hw-overrides .steam-hw-input,
+            .steam-hw-profile-tools .steam-hw-profile-select {
+                width: 100%;
+                max-width: none;
+                min-width: 0;
+            }
+
+            .steam-hw-profile-tools label span,
+            .steam-hw-overrides label span,
+            .steam-hw-section-title {
+                color: #acb8c1;
+                font-size: 11px;
+                font-weight: 700;
+                text-transform: uppercase;
+            }
+
+            .steam-hw-profile-buttons {
+                display: flex;
+                align-items: end;
+                flex-wrap: wrap;
+                gap: 8px;
+                grid-column: 1 / -1;
+            }
+
+            .steam-hw-section-title {
+                grid-column: 1 / -1;
+            }
+
             .steam-hw-textarea {
                 box-sizing: border-box;
                 width: 100%;
-                min-height: 300px;
+                min-height: 190px;
+                max-height: min(360px, 42vh);
+                max-height: min(360px, 42dvh);
                 resize: vertical;
                 padding: 12px;
                 border: 1px solid #3d4450;
@@ -2088,6 +3153,13 @@
 
             .steam-hw-dialog-actions {
                 justify-content: flex-end;
+                position: sticky;
+                bottom: -18px;
+                z-index: 1;
+                margin: 0 -18px -18px;
+                padding: 10px 18px 18px;
+                border-top: 1px solid rgba(255, 255, 255, 0.08);
+                background: linear-gradient(180deg, rgba(32, 37, 45, 0.94), #20252d 28%);
             }
 
             .steam-hw-dialog-spacer {
@@ -2104,10 +3176,16 @@
 
                 .steam-hw-actions {
                     width: 100%;
+                    flex-wrap: wrap;
                 }
 
                 .steam-hw-actions .steam-hw-button {
                     flex: 1 1 auto;
+                }
+
+                .steam-hw-profile-select {
+                    max-width: none;
+                    width: 100%;
                 }
 
                 .steam-hw-score {
@@ -2121,6 +3199,17 @@
 
                 .steam-hw-preview-grid {
                     grid-template-columns: 1fr;
+                }
+
+                .steam-hw-profile-tools,
+                .steam-hw-overrides {
+                    grid-template-columns: 1fr;
+                }
+
+                .steam-hw-survey-box,
+                .steam-hw-buy-warning {
+                    align-items: stretch;
+                    flex-direction: column;
                 }
 
                 .steam-hw-dialog-actions {
@@ -2220,6 +3309,10 @@
 
     function trimNumber(value) {
         return Number(value.toFixed(value >= 10 ? 1 : 2)).toLocaleString('cs-CZ');
+    }
+
+    function formatNumberInput(value) {
+        return Number(value.toFixed(value >= 10 ? 1 : 2)).toString();
     }
 
     function cleanText(value) {
