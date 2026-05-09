@@ -2,7 +2,7 @@
 // @name              Steam-HW
 // @name:cs           Steam-HW: porovnání hardwaru
 // @namespace         https://github.com/Kamdar-Wolf/Script
-// @version           1.1.1
+// @version           1.1.2
 // @description       Porovnává hardware zadaný uživatelem s minimálními a doporučenými požadavky her na Steam Store a ukazuje odhad hratelnosti.
 // @author            Kamdar-Wolf
 // @license           MIT
@@ -32,7 +32,7 @@
     const SCRIPT = {
         id: 'steam-hw',
         name: 'Steam-HW',
-        version: '1.1.1',
+        version: '1.1.2',
         author: 'Kamdar-Wolf',
         license: 'MIT',
         profileKey: 'steam-hw.profileText',
@@ -51,8 +51,8 @@
     };
 
     const SCORE_UNKNOWN = null;
-    const COOKIE_MAX_CHUNKS = 60;
-    const COOKIE_CHUNK_SIZE = 3000;
+    const COOKIE_MAX_CHUNKS = 80;
+    const COOKIE_SAFE_MAX_BYTES = 2800;
     const COOKIE_MAX_AGE_SECONDS = 60 * 60 * 24 * 365;
     const SURVEY_REFRESH_MS = 1000 * 60 * 60 * 24 * 30;
     const BADGE_FETCH_LIMIT = 12;
@@ -192,6 +192,7 @@
     ];
 
     function main() {
+        cleanupOversizedSteamHwCookies();
         installStyles();
         registerMenuCommands();
         ready(() => {
@@ -1979,7 +1980,9 @@
     }
 
     function writeProfiles(profiles) {
-        writeStoredValue(SCRIPT.profilesKey, normalizeProfiles(profiles));
+        const normalized = normalizeProfiles(profiles);
+        writeLocalStoredValue(SCRIPT.profilesKey, normalized);
+        writeProfilesCookieSummary(normalized);
     }
 
     function getActiveProfile(profiles = readProfiles()) {
@@ -2034,7 +2037,8 @@
         profile.updatedAt = new Date().toISOString();
         profiles.activeId = profile.id;
         writeProfiles(profiles);
-        writeStoredValue(SCRIPT.profileKey, profile.text);
+        writeLocalStoredValue(SCRIPT.profileKey, profile.text);
+        writeProfileSummaryCookie(profile);
         return profile;
     }
 
@@ -2138,7 +2142,8 @@
         profile.text = String(value || '');
         profile.updatedAt = new Date().toISOString();
         writeProfiles(profiles);
-        writeStoredValue(SCRIPT.profileKey, profile.text);
+        writeLocalStoredValue(SCRIPT.profileKey, profile.text);
+        writeProfileSummaryCookie(profile);
     }
 
     function toggleCompactDisplay() {
@@ -2165,6 +2170,10 @@
             return cookieValue.value;
         }
 
+        return readLocalStoredValue(key, fallback);
+    }
+
+    function readLocalStoredValue(key, fallback) {
         let legacyValue = fallback;
         let foundLegacy = false;
 
@@ -2189,23 +2198,27 @@
             }
         }
 
-        if (foundLegacy) {
-            writeCookieStoredValue(key, legacyValue);
-            return legacyValue;
-        }
-
-        return fallback;
+        return foundLegacy ? legacyValue : fallback;
     }
 
     function writeStoredValue(key, value) {
         writeCookieStoredValue(key, value);
+        writeLocalStoredValue(key, value);
+    }
 
+    function writeLocalStoredValue(key, value) {
         try {
             if (typeof GM_setValue === 'function') {
                 GM_setValue(key, value);
             }
         } catch (error) {
             console.warn(`${SCRIPT.name}: GM_setValue selhalo`, error);
+        }
+
+        try {
+            window.localStorage.setItem(key, JSON.stringify(value));
+        } catch (error) {
+            console.warn(`${SCRIPT.name}: localStorage zápis selhal`, error);
         }
     }
 
@@ -2230,27 +2243,18 @@
     function readCookieStoredValue(key) {
         try {
             const base = cookieBaseName(key);
+            const singleValue = readCookie(base);
+            if (singleValue) {
+                return { found: true, value: JSON.parse(decodeURIComponent(singleValue)) };
+            }
+
             const countRaw = readCookie(`${base}_count`);
             if (!countRaw) {
                 return { found: false, value: null };
             }
 
-            const count = Number(countRaw);
-            if (!Number.isInteger(count) || count < 1 || count > COOKIE_MAX_CHUNKS) {
-                deleteCookieStoredValue(key);
-                return { found: false, value: null };
-            }
-
-            let encoded = '';
-            for (let index = 0; index < count; index += 1) {
-                const chunk = readCookie(`${base}_${index}`);
-                if (chunk == null) {
-                    return { found: false, value: null };
-                }
-                encoded += chunk;
-            }
-
-            return { found: true, value: JSON.parse(decodeURIComponent(encoded)) };
+            deleteCookieStoredValue(key);
+            return { found: false, value: null };
         } catch (error) {
             console.warn(`${SCRIPT.name}: cookie čtení selhalo`, error);
             return { found: false, value: null };
@@ -2259,21 +2263,22 @@
 
     function writeCookieStoredValue(key, value) {
         try {
-            const base = cookieBaseName(key);
-            const encoded = encodeURIComponent(JSON.stringify(value));
-            const chunks = [];
-            for (let index = 0; index < encoded.length; index += COOKIE_CHUNK_SIZE) {
-                chunks.push(encoded.slice(index, index + COOKIE_CHUNK_SIZE));
+            if (!canStoreKeyInCookie(key)) {
+                deleteCookieStoredValue(key);
+                return;
             }
 
-            if (chunks.length > COOKIE_MAX_CHUNKS) {
-                console.warn(`${SCRIPT.name}: hodnota ${key} je příliš velká pro cookie úložiště`);
+            const base = cookieBaseName(key);
+            const encoded = encodeURIComponent(JSON.stringify(value));
+
+            if (encoded.length > COOKIE_SAFE_MAX_BYTES) {
+                deleteCookieStoredValue(key);
+                console.warn(`${SCRIPT.name}: hodnota ${key} je příliš velká pro bezpečné cookie úložiště`);
                 return;
             }
 
             deleteCookieStoredValue(key);
-            setCookie(`${base}_count`, String(chunks.length));
-            chunks.forEach((chunk, index) => setCookie(`${base}_${index}`, chunk));
+            setCookie(base, encoded);
         } catch (error) {
             console.warn(`${SCRIPT.name}: cookie zápis selhal`, error);
         }
@@ -2281,9 +2286,72 @@
 
     function deleteCookieStoredValue(key) {
         const base = cookieBaseName(key);
+        expireCookie(base);
         expireCookie(`${base}_count`);
         for (let index = 0; index < COOKIE_MAX_CHUNKS; index += 1) {
             expireCookie(`${base}_${index}`);
+        }
+    }
+
+    function canStoreKeyInCookie(key) {
+        return key === SCRIPT.optionsKey;
+    }
+
+    function cleanupOversizedSteamHwCookies() {
+        try {
+            document.cookie
+                .split(';')
+                .map((part) => part.split('=')[0].trim())
+                .filter((name) => name.startsWith(SCRIPT.cookiePrefix))
+                .forEach((name) => {
+                    const oldLargeCookie =
+                        name.startsWith(`${SCRIPT.cookiePrefix}steam_hw_profileText`) ||
+                        name.startsWith(`${SCRIPT.cookiePrefix}steam_hw_profiles`) ||
+                        name.startsWith(`${SCRIPT.cookiePrefix}steam_hw_hardwareSurvey`);
+                    if (/_count$|_\d+$/.test(name) || oldLargeCookie) {
+                        expireCookie(name);
+                    }
+                });
+        } catch (error) {
+            console.warn(`${SCRIPT.name}: nouzové čištění cookies selhalo`, error);
+        }
+    }
+
+    function writeProfilesCookieSummary(profiles) {
+        const active = getActiveProfile(profiles);
+        writeSmallCookie('profiles_index', {
+            activeId: profiles.activeId,
+            activeName: active?.name || '',
+            count: profiles.items.length,
+            updatedAt: active?.updatedAt || new Date().toISOString(),
+        });
+    }
+
+    function writeProfileSummaryCookie(profileRecord) {
+        const options = readOptions();
+        const parsed = parseSteamHardwareProfile(profileRecord.text || '', options, profileRecord);
+        writeSmallCookie('profile_summary', {
+            id: profileRecord.id,
+            name: profileRecord.name,
+            cpu: parsed.cpu.name || '',
+            gpu: parsed.gpu.name || '',
+            ramMb: parsed.memory.ramMb || null,
+            vramMb: parsed.gpu.effectiveVramMb || null,
+            updatedAt: profileRecord.updatedAt || new Date().toISOString(),
+        });
+    }
+
+    function writeSmallCookie(name, value) {
+        try {
+            const cookieName = `${SCRIPT.cookiePrefix}${name}`;
+            const encoded = encodeURIComponent(JSON.stringify(value));
+            if (encoded.length > COOKIE_SAFE_MAX_BYTES) {
+                expireCookie(cookieName);
+                return;
+            }
+            setCookie(cookieName, encoded);
+        } catch (error) {
+            console.warn(`${SCRIPT.name}: zápis malé cookie selhal`, error);
         }
     }
 
